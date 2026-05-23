@@ -1,0 +1,5 @@
+google-generativeai
+colorama
+python-dotenv
+pdfplumber
+PyPDF2

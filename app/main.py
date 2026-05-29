@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routers import corpus, pipeline
+from app.routers import corpus, pipeline, preinforme
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +69,7 @@ app.add_middleware(
 
 app.include_router(pipeline.router)
 app.include_router(corpus.router)
+app.include_router(preinforme.router)
 
 
 @app.get("/", include_in_schema=False)

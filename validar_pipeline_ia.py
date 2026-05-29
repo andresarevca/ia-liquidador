@@ -39,6 +39,30 @@ except ImportError:
     print("\n[ERROR] Falta instalar: pip install google-generativeai python-dotenv colorama\n")
     sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# Importaciones desde services/ (pipeline refactorizado)
+# ---------------------------------------------------------------------------
+try:
+    from services import gemini_client as _gemini_client
+    from services.pipeline import (
+        ejecutar_pipeline as _ejecutar_pipeline,
+        preparar_documentos as _preparar_documentos,
+    )
+    _SERVICES_OK = True
+except ImportError:
+    _SERVICES_OK = False  # Fallback a implementación local (modo legado)
+
+# Vector store + embeddings (opcional — requiere: pip install chromadb)
+try:
+    from vector_store import (
+        CorpusLegal,
+        CasosHistoricos,
+        construir_contexto_legal_rag,
+    )
+    _RAG_DISPONIBLE = True
+except ImportError:
+    _RAG_DISPONIBLE = False
+
 try:
     from colorama import Fore, Style, init as colorama_init
     colorama_init(autoreset=True)
@@ -597,18 +621,33 @@ REGLAS ESTRICTAS:
 5. Si hay conflictos en los datos del Paso B, mencionarlos obligatoriamente.
 """.strip()
 
-def prompt_paso_c(json_paso_b: dict, municipio: str) -> str:
+def prompt_paso_c(
+    json_paso_b: dict,
+    municipio: str,
+    contexto_legal: str | None = None,
+) -> str:
+    """
+    Construye el prompt del Paso C.
+    Si contexto_legal es provisto (modo RAG), lo usa en lugar de los textos
+    legales hardcodeados.
+    """
+    if contexto_legal is None:
+        bloque_normativo = (
+            f"ORDENANZA MUNICIPAL — {municipio}:\n{ORDENANZA_SAN_LORENZO}\n\n"
+            f"LEY N° 5016/14 — ARTÍCULOS RELEVANTES:\n{LEY_5016_FRAGMENTOS}"
+        )
+    else:
+        bloque_normativo = (
+            f"NORMATIVA RECUPERADA SEMÁNTICAMENTE (municipio: {municipio}):\n"
+            f"{contexto_legal}"
+        )
     return f"""
 Analiza el siguiente caso de siniestro vehicular y emite una sugerencia de dictamen.
 
 DATOS DEL CASO (Paso B):
 {json.dumps(json_paso_b, ensure_ascii=False, indent=2)}
 
-ORDENANZA MUNICIPAL — {municipio}:
-{ORDENANZA_SAN_LORENZO}
-
-LEY N° 5016/14 — ARTÍCULOS RELEVANTES:
-{LEY_5016_FRAGMENTOS}
+{bloque_normativo}
 
 Devuelve EXCLUSIVAMENTE este JSON:
 
@@ -639,11 +678,24 @@ Devuelve EXCLUSIVAMENTE este JSON:
 """.strip()
 
 
-def ejecutar_paso_c(json_paso_b: dict) -> dict | None:
+def ejecutar_paso_c(
+    json_paso_b: dict,
+    contexto_legal: str | None = None,
+    precedentes: list | None = None,
+) -> dict | None:
     titulo("PASO C — Análisis normativo y dictamen sugerido", Fore.MAGENTA)
     municipio = json_paso_b.get("siniestro", {}).get("municipio", "San Lorenzo")
     info(f"Aplicando normativa de: {municipio}")
-    respuesta = llamar_gemini(GEMINI_MODEL_FAST, SYSTEM_C, prompt_paso_c(json_paso_b, municipio))
+    if contexto_legal is not None:
+        info("Modo RAG: usando artículos recuperados semánticamente")
+    if precedentes:
+        info(f"Precedentes similares encontrados: {len(precedentes)}")
+        for p in precedentes:
+            info(f"   [{p['caso_id']}] sim={p['similitud']:.2f} → {p['responsabilidad']}")
+    respuesta = llamar_gemini(
+        GEMINI_MODEL_FAST, SYSTEM_C,
+        prompt_paso_c(json_paso_b, municipio, contexto_legal=contexto_legal),
+    )
     if respuesta is None:
         return None
     parsed = parsear_json_seguro(respuesta)
@@ -741,8 +793,12 @@ def guardar_resultados(resultados_a, json_b, json_c, caso_id):
     base = Path("resultados") / f"{caso_id}_{timestamp}"
     base.mkdir(parents=True, exist_ok=True)
 
+    resultados_a_serializables = [
+        {k: v for k, v in r.items() if k != "gemini_file"}
+        for r in resultados_a
+    ]
     with open(base / "paso_a_clasificacion.json", "w", encoding="utf-8") as f:
-        json.dump(resultados_a, f, ensure_ascii=False, indent=2)
+        json.dump(resultados_a_serializables, f, ensure_ascii=False, indent=2)
     if json_b:
         with open(base / "paso_b_extraccion.json", "w", encoding="utf-8") as f:
             json.dump(json_b, f, ensure_ascii=False, indent=2)
@@ -770,6 +826,9 @@ EXTENSIONES_SOPORTADAS = {
     ".gif":  "IMAGEN",
     ".webp": "IMAGEN",
     ".txt":  "TEXTO_PLANO",
+    ".docx": "WORD_DOC",
+    ".doc":  "WORD_DOC",
+    ".odt":  "WORD_DOC",
 }
 
 # MIME types para la File API de Gemini (OCR nativo)
@@ -850,6 +909,48 @@ def extraer_contenido_archivo(archivo: Path, formato: str) -> str:
             "En Fase 2 Gemini procesará la imagen directamente vía API multimodal."
         )
 
+    if formato == "WORD_DOC":
+        sufijo = archivo.suffix.lower()
+        if sufijo == ".docx":
+            try:
+                import docx
+                doc = docx.Document(str(archivo))
+                texto = "\n".join(p.text for p in doc.paragraphs).strip()
+                if texto:
+                    return texto
+            except ImportError:
+                pass
+            except Exception as e:
+                warn(f"python-docx falló en {archivo.name}: {e}")
+            return (
+                f"[DOCX sin texto extraíble: {archivo.name}]\n"
+                "Instalar 'python-docx' para extracción automática."
+            )
+        if sufijo == ".odt":
+            try:
+                from odf.opendocument import load as odf_load
+                from odf.text import P
+                odf_doc = odf_load(str(archivo))
+                texto = "\n".join(
+                    str(el) for el in odf_doc.getElementsByType(P)
+                ).strip()
+                if texto:
+                    return texto
+            except ImportError:
+                pass
+            except Exception as e:
+                warn(f"odfpy falló en {archivo.name}: {e}")
+            return (
+                f"[ODT sin texto extraíble: {archivo.name}]\n"
+                "Instalar 'odfpy' para extracción automática."
+            )
+        # .doc binario — requiere herramienta externa (antiword / LibreOffice)
+        return (
+            f"[DOC binario: {archivo.name}]\n"
+            "El formato .doc antiguo no es soportado directamente. "
+            "Convertir a .docx con LibreOffice antes de procesar."
+        )
+
     return f"[Formato no soportado para extracción de texto: {archivo.name}]"
 
 
@@ -880,6 +981,9 @@ def cargar_documentos_de_carpeta(ruta_carpeta: Path) -> list:
         # Archivos de texto: leer directamente; PDFs e imágenes: subir a la File API
         if formato == "TEXTO_PLANO":
             contenido = archivo.read_text(encoding="utf-8", errors="replace")
+            gemini_file = None
+        elif formato == "WORD_DOC":
+            contenido = extraer_contenido_archivo(archivo, formato)
             gemini_file = None
         else:
             contenido = f"[OCR Gemini: {archivo.name}]"
@@ -914,6 +1018,21 @@ def main():
         "--solo-paso", type=int, choices=[1, 2, 3], default=None,
         help="Ejecutar solo el paso indicado (útil para debug)"
     )
+    parser.add_argument(
+        "--rag", action="store_true",
+        help="Activar RAG: indexa el corpus legal y busca artículos relevantes "
+             "semánticamente para el Paso C (requiere: pip install chromadb)"
+    )
+    parser.add_argument(
+        "--indexar-ordenanza", type=str, default=None, metavar="PDF",
+        help="Ruta a un PDF de ordenanza municipal para indexar en el corpus legal "
+             "(implica --rag). Ej: --indexar-ordenanza carpeta/Ordenanza.pdf "
+             "--municipio-ordenanza Katueté"
+    )
+    parser.add_argument(
+        "--municipio-ordenanza", type=str, default=None,
+        help="Municipio de la ordenanza a indexar (usar con --indexar-ordenanza)"
+    )
     args = parser.parse_args()
 
     # Verificar API key
@@ -932,6 +1051,57 @@ def main():
     print("  ║   Paraguay · Ley 5016/14                         ║")
     print("  ╚══════════════════════════════════════════════════╝")
     print(f"{Style.RESET_ALL}")
+
+    # -----------------------------------------------------------------------
+    # Inicialización RAG (opcional)
+    # -----------------------------------------------------------------------
+    corpus_legal   = None
+    casos_hist     = None
+    usar_rag       = args.rag or bool(args.indexar_ordenanza)
+
+    if usar_rag:
+        if not _RAG_DISPONIBLE:
+            warn("--rag requiere ChromaDB: pip install chromadb")
+            warn("Continuando sin RAG...")
+            usar_rag = False
+        else:
+            titulo("INICIALIZANDO VECTOR STORE (RAG)", Fore.CYAN)
+            corpus_legal = CorpusLegal()
+            casos_hist   = CasosHistoricos()
+
+            # Indexar corpus legal integrado (idempotente)
+            n_ley = corpus_legal.indexar_texto(
+                "Ley 5016-14", LEY_5016_FRAGMENTOS,
+                municipio="Nacional", tipo="LEY",
+            )
+            n_ord = corpus_legal.indexar_texto(
+                "Ordenanza 45-2019 San Lorenzo", ORDENANZA_SAN_LORENZO,
+                municipio="San Lorenzo", tipo="ORDENANZA",
+            )
+            if n_ley or n_ord:
+                ok(f"Corpus legal: {n_ley} chunk(s) Ley 5016 + {n_ord} chunk(s) Ordenanza SL")
+            else:
+                info(f"Corpus legal ya indexado ({corpus_legal.contar()} chunks en total)")
+
+            # Indexar PDF de ordenanza adicional si se proveyó
+            if args.indexar_ordenanza:
+                arch_ord = Path(args.indexar_ordenanza)
+                if not arch_ord.exists():
+                    error(f"Ordenanza no encontrada: {args.indexar_ordenanza}")
+                else:
+                    municipio_ord = args.municipio_ordenanza or arch_ord.stem
+                    try:
+                        n = corpus_legal.indexar_pdf(arch_ord, municipio=municipio_ord)
+                        ok(f"Ordenanza indexada: {arch_ord.name} → {n} chunk(s) ({municipio_ord})")
+                    except Exception as e:
+                        warn(f"No se pudo indexar la ordenanza: {e}")
+
+            # Cargar casos históricos previos (idempotente)
+            n_hist = casos_hist.cargar_desde_resultados()
+            if n_hist:
+                ok(f"{n_hist} caso(s) histórico(s) nuevo(s) indexado(s)")
+            else:
+                info(f"Casos históricos: {casos_hist.contar()} en el store")
 
     caso_id = DOCUMENTO_FICTICIO["caso_id"]
     documentos = DOCUMENTO_FICTICIO["documentos"]
@@ -966,28 +1136,59 @@ def main():
 
     inicio = time.time()
 
-    # Paso A
-    if args.solo_paso is None or args.solo_paso == 1:
-        resultados_a = ejecutar_paso_a(documentos)
+    # -----------------------------------------------------------------------
+    # Ejecución del pipeline — usa services/ si está disponible
+    # -----------------------------------------------------------------------
+    if _SERVICES_OK and args.solo_paso is None and args.carpeta:
+        # Modo services/: delegar completamente al módulo refactorizado
+        _gemini_client.configure(api_key)
+        info("Ejecutando pipeline via services/ (modo microservicio)...")
+        archivos = [{"ruta": str(Path(args.carpeta) / d["nombre_archivo"]), "nombre": d["nombre_archivo"]}
+                    for d in documentos]
+        resultado = _ejecutar_pipeline(caso_id, archivos, usar_rag=usar_rag)
+        resultados_a = resultado.get("paso_a", [])
+        json_b = resultado.get("paso_b")
+        json_c = resultado.get("paso_c")
+        tiempo_total = resultado.get("tiempo_segundos", time.time() - inicio)
     else:
-        resultados_a = []
-        warn("Paso A omitido por --solo-paso")
+        # Modo legado: ejecutar paso a paso con las funciones locales del script
+        # Paso A
+        if args.solo_paso is None or args.solo_paso == 1:
+            resultados_a = ejecutar_paso_a(documentos)
+        else:
+            resultados_a = []
+            warn("Paso A omitido por --solo-paso")
 
-    # Paso B
-    json_b = None
-    if args.solo_paso is None or args.solo_paso == 2:
-        json_b = ejecutar_paso_b(resultados_a, caso_id)
-    else:
-        warn("Paso B omitido por --solo-paso")
+        # Paso B
+        json_b = None
+        if args.solo_paso is None or args.solo_paso == 2:
+            json_b = ejecutar_paso_b(resultados_a, caso_id)
+        else:
+            warn("Paso B omitido por --solo-paso")
 
-    # Paso C
-    json_c = None
-    if (args.solo_paso is None or args.solo_paso == 3) and json_b:
-        json_c = ejecutar_paso_c(json_b)
-    elif json_b is None and args.solo_paso != 1:
-        warn("Paso C omitido — Paso B no produjo resultado")
+        # Paso C
+        json_c = None
+        if (args.solo_paso is None or args.solo_paso == 3) and json_b:
+            contexto_legal_rag = None
+            precedentes_rag    = None
+            if usar_rag and corpus_legal:
+                desc_caso = json_b.get("siniestro", {}).get("descripcion_dinamica", "")
+                municipio_caso = json_b.get("siniestro", {}).get("municipio", "")
+                if desc_caso:
+                    contexto_legal_rag = construir_contexto_legal_rag(
+                        desc_caso, municipio_caso, corpus_legal
+                    )
+                    if casos_hist:
+                        precedentes_rag = casos_hist.buscar_similares(desc_caso)
+            json_c = ejecutar_paso_c(
+                json_b,
+                contexto_legal=contexto_legal_rag,
+                precedentes=precedentes_rag,
+            )
+        elif json_b is None and args.solo_paso != 1:
+            warn("Paso C omitido — Paso B no produjo resultado")
 
-    tiempo_total = time.time() - inicio
+        tiempo_total = time.time() - inicio
 
     # Reporte
     imprimir_reporte(resultados_a, json_b, json_c, tiempo_total)
@@ -995,6 +1196,12 @@ def main():
     # Guardar resultados
     if resultados_a or json_b or json_c:
         carpeta = guardar_resultados(resultados_a, json_b, json_c, caso_id)
+
+        # Indexar el caso recién procesado en el store de precedentes
+        if usar_rag and casos_hist and json_b and json_c:
+            timestamp = carpeta.name.split("_", 1)[-1] if "_" in carpeta.name else ""
+            if casos_hist.indexar_caso(caso_id, json_b, json_c, timestamp):
+                ok(f"Caso indexado en vector store: {caso_id}")
 
     # Mostrar narrativo del dictamen si existe
     if json_c and json_c.get("dictamen", {}).get("analisis_narrativo"):

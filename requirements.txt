@@ -1,5 +1,23 @@
+# API framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Settings
+pydantic-settings
+
+# AI / Gemini
 google-generativeai
-colorama
-python-dotenv
+
+# Extracción de texto
 pdfplumber
 PyPDF2
+python-docx
+odfpy
+
+# Utilidades
+python-dotenv
+colorama
+
+# Vector store + embeddings (opcional — activa RAG)
+chromadb

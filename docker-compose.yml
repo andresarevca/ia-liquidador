@@ -1,0 +1,22 @@
+services:
+
+  ia:
+    build: .
+    container_name: ia_liquidador
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    volumes:
+      - vector_db:/app/vector_db
+      - /tmp/ia-liquidador:/tmp/ia-liquidador
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/api/pipeline/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  vector_db:

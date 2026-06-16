@@ -11,6 +11,8 @@ services:
       - vector_db:/app/vector_db
       - /tmp/ia-liquidador:/tmp/ia-liquidador
     restart: unless-stopped
+    networks:
+      - backend-liquidador_backend_liquidador_network
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/api/pipeline/health')"]
       interval: 30s
@@ -20,3 +22,7 @@ services:
 
 volumes:
   vector_db:
+
+networks:
+  backend-liquidador_backend_liquidador_network:
+    external: true

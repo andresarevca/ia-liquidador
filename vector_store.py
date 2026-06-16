@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Importaciones opcionales
@@ -59,11 +62,34 @@ except ImportError:
 VECTOR_DB_PATH   = "vector_db"           # carpeta local del store persistente
 COL_LEGAL        = "corpus_legal"
 COL_CASOS        = "casos_historicos"
-EMBEDDING_MODEL  = "models/text-embedding-004"
+EMBEDDING_MODEL  = "models/gemini-embedding-001"
+OCR_MODEL        = "gemini-2.5-flash"
 TOP_K_LEGAL      = 6                     # artículos a recuperar por consulta
 TOP_K_CASOS      = 3                     # casos similares a recuperar
 CHUNK_SIZE       = 900                   # caracteres por chunk (fallback)
 CHUNK_OVERLAP    = 120
+
+
+# ---------------------------------------------------------------------------
+# Excepción estructurada para fallos de extracción de PDF
+# ---------------------------------------------------------------------------
+
+class PDFExtractionError(Exception):
+    """
+    Se lanza cuando ningún método pudo extraer texto de un PDF.
+
+    Atributos:
+        archivo  : nombre del archivo que falló
+        intentos : lista de tuplas (método, motivo_del_fallo)
+    """
+
+    def __init__(self, archivo: str, intentos: list[tuple[str, str]]):
+        self.archivo  = archivo
+        self.intentos = intentos
+        detalle = "; ".join(f"{m}: {r}" for m, r in intentos)
+        super().__init__(
+            f"No se pudo extraer texto de '{archivo}'. Intentos: [{detalle}]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -263,11 +289,9 @@ class CorpusLegal:
     def indexar_pdf(self, archivo: Path, municipio: str) -> int:
         """
         Extrae texto de un PDF y lo indexa en el corpus legal.
-        Útil para cargar ordenanzas municipales directamente desde archivo.
+        Lanza PDFExtractionError si ningún método (directo ni OCR Gemini) tiene éxito.
         """
-        texto = _extraer_texto_pdf(archivo)
-        if not texto:
-            raise ValueError(f"No se pudo extraer texto de: {archivo.name}")
+        texto = _extraer_texto_pdf(archivo)   # raises PDFExtractionError on failure
         titulo = archivo.stem
         return self.indexar_texto(titulo, texto, municipio=municipio, tipo="ORDENANZA")
 
@@ -497,29 +521,90 @@ def construir_contexto_legal_rag(
 # ---------------------------------------------------------------------------
 
 def _extraer_texto_pdf(archivo: Path) -> str:
-    """Extrae texto de un PDF usando pdfplumber (preferido) o PyPDF2."""
+    """
+    Extrae texto de un PDF en tres intentos:
+      1. pdfplumber  (texto nativo)
+      2. PyPDF2      (texto nativo, fallback)
+      3. Gemini OCR  (File API — para PDFs escaneados/imagen)
+
+    Raises:
+        PDFExtractionError: si ningún método devuelve texto.
+    """
+    intentos: list[tuple[str, str]] = []
+
+    # 1. pdfplumber
     try:
         import pdfplumber
         with pdfplumber.open(archivo) as pdf:
-            return "\n".join(p.extract_text() or "" for p in pdf.pages).strip()
+            texto = "\n".join(p.extract_text() or "" for p in pdf.pages).strip()
+        if texto:
+            return texto
+        intentos.append(("pdfplumber", "sin texto (PDF posiblemente escaneado)"))
     except ImportError:
-        pass
-    except Exception:
-        pass
+        intentos.append(("pdfplumber", "no instalado"))
+    except Exception as e:
+        intentos.append(("pdfplumber", str(e)))
 
+    # 2. PyPDF2
     try:
         import PyPDF2
         with open(archivo, "rb") as f:
             reader = PyPDF2.PdfReader(f)
-            return "\n".join(
-                (p.extract_text() or "") for p in reader.pages
-            ).strip()
+            texto = "\n".join((p.extract_text() or "") for p in reader.pages).strip()
+        if texto:
+            return texto
+        intentos.append(("PyPDF2", "sin texto (PDF posiblemente escaneado)"))
     except ImportError:
-        pass
-    except Exception:
-        pass
+        intentos.append(("PyPDF2", "no instalado"))
+    except Exception as e:
+        intentos.append(("PyPDF2", str(e)))
 
-    return ""
+    # 3. Gemini OCR (File API)
+    try:
+        texto = _extraer_texto_ocr_gemini(archivo)
+        if texto:
+            return texto
+        intentos.append(("Gemini OCR", "modelo no devolvió texto"))
+    except Exception as e:
+        intentos.append(("Gemini OCR", str(e)))
+
+    raise PDFExtractionError(archivo=archivo.name, intentos=intentos)
+
+
+def _extraer_texto_ocr_gemini(archivo: Path) -> str:
+    """
+    Sube el PDF a la Gemini File API y extrae su texto mediante OCR nativo.
+    Elimina el archivo remoto al terminar para no acumular cuota.
+
+    Raises:
+        RuntimeError: si genai no está configurado o la API falla.
+    """
+    if not _GENAI_OK:
+        raise RuntimeError("google-generativeai no instalado")
+
+    logger.info("Gemini OCR: subiendo '%s' a la File API...", archivo.name)
+    archivo_remoto = genai.upload_file(
+        path=str(archivo),
+        mime_type="application/pdf",
+        display_name=archivo.name,
+    )
+
+    try:
+        model = genai.GenerativeModel(model_name=OCR_MODEL)
+        respuesta = model.generate_content([
+            archivo_remoto,
+            (
+                "Extrae todo el texto de este documento PDF tal como aparece, "
+                "conservando la numeración de artículos, títulos y párrafos. "
+                "No agregues comentarios ni formato adicional."
+            ),
+        ])
+        return (respuesta.text or "").strip()
+    finally:
+        try:
+            genai.delete_file(archivo_remoto.name)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -575,8 +660,12 @@ def _cli_main():
         if not archivo.exists():
             print(f"[ERROR] Archivo no encontrado: {args.indexar_pdf}")
             sys.exit(1)
-        n = corpus.indexar_pdf(archivo, municipio=args.municipio)
-        print(f"[OK] {archivo.name} → {n} chunk(s) indexado(s) (municipio: {args.municipio})")
+        try:
+            n = corpus.indexar_pdf(archivo, municipio=args.municipio)
+            print(f"[OK] {archivo.name} → {n} chunk(s) indexado(s) (municipio: {args.municipio})")
+        except PDFExtractionError as e:
+            print(f"[ERROR] {e}")
+            sys.exit(1)
 
     if args.buscar:
         resultados = corpus.buscar_relevantes(args.buscar, n=5)

@@ -87,6 +87,21 @@ def _mapear_documentacion(documentacion: dict, documentos_lista: list) -> list[d
     return resultado
 
 
+def _normalizar_conflictos(conflictos: list) -> list[dict]:
+    """Normaliza conflictos a la forma {campo, valor_doc_1, valor_doc_2, descripcion}.
+
+    Gemini debería devolver siempre dicts con esa forma, pero a veces (o en datos
+    de paso_b generados antes de fijar el schema) emite strings descriptivos sueltos.
+    """
+    resultado = []
+    for c in conflictos:
+        if isinstance(c, dict):
+            resultado.append(c)
+        else:
+            resultado.append({"campo": "", "valor_doc_1": "", "valor_doc_2": "", "descripcion": str(c)})
+    return resultado
+
+
 def _extraer_normas(infracciones: list) -> list[str]:
     """Extrae artículos legales únicos citados en las infracciones."""
     normas = []
@@ -311,5 +326,5 @@ def generar_datos_preinforme(
         "alertas_liquidador": dictamen.get("alertas_liquidador", []),
         "confianza_dictamen": dictamen.get("confianza_dictamen", 0),
         "calidad_extraccion": paso_b.get("calidad_extraccion", {}),
-        "conflictos": conflictos,
+        "conflictos": _normalizar_conflictos(conflictos),
     }

@@ -83,6 +83,30 @@ REGLAS ESTRICTAS:
 4. Ante la duda entre dos tipos, usa OTRO y describe en nota_clasificacion.
 """.strip()
 
+_TIPOS_DOC = [
+    "POLIZA", "DENUNCIA_POLICIAL", "DENUNCIA_ADMINISTRATIVA", "PERICIA_TECNICA",
+    "PRESUPUESTO_TALLER", "FOTO_EVENTO", "FOTO_DANIOS", "CEDULA_VERDE",
+    "LICENCIA_CONDUCIR", "INFORME_MEDICO", "OTRO",
+]
+
+# Fuerza tipos/enums/campos requeridos en la respuesta de Gemini (ver services/gemini_client.py).
+# No reemplaza al prompt: el prompt guía el CONTENIDO, esto garantiza la ESTRUCTURA.
+_ESQUEMA_A = {
+    "type": "object",
+    "properties": {
+        "tipo_doc": {"type": "string", "enum": _TIPOS_DOC},
+        "legible": {"type": "boolean"},
+        "confianza": {"type": "number", "description": "Escala 0.0 a 1.0, nunca 0 a 100"},
+        "nota_clasificacion": {"type": "string", "nullable": True},
+        "pertenece_al_caso": {"type": "boolean"},
+        "razon_pertenencia": {"type": "string"},
+    },
+    "required": [
+        "tipo_doc", "legible", "confianza", "nota_clasificacion",
+        "pertenece_al_caso", "razon_pertenencia",
+    ],
+}
+
 
 def ejecutar_paso_a(documentos: list[dict]) -> list[dict]:
     """
@@ -119,7 +143,7 @@ Clasifica este documento y devuelve EXCLUSIVAMENTE este JSON:
 }}""".strip()
 
         partes = [gemini_file] if gemini_file else None
-        respuesta = llamar_gemini(_SYSTEM_A, prompt, partes=partes)
+        respuesta = llamar_gemini(_SYSTEM_A, prompt, partes=partes, response_schema=_ESQUEMA_A)
 
         if respuesta:
             parsed = parsear_json(respuesta)
@@ -202,6 +226,129 @@ _SCHEMA_B = """
 }
 """.strip()
 
+_ROLES_VEHICULO = ["ASEGURADO", "TERCERO_1"]
+
+_ESQUEMA_B = {
+    "type": "object",
+    "properties": {
+        "siniestro": {
+            "type": "object",
+            "properties": {
+                "fecha_hora": {"type": "string", "nullable": True, "description": "ISO 8601"},
+                "municipio": {"type": "string", "nullable": True},
+                "direccion_aproximada": {"type": "string", "nullable": True},
+                "tipo_via": {
+                    "type": "string", "nullable": True,
+                    "enum": ["CALLE_URBANA", "RUTA_NACIONAL", "RUTA_DEPARTAMENTAL", "ESTACIONAMIENTO", "OTRA"],
+                },
+                "condicion_climatica": {
+                    "type": "string",
+                    "enum": ["DESPEJADO", "LLUVIA", "NIEBLA", "NOCHE", "DESCONOCIDO"],
+                },
+                "descripcion_dinamica": {"type": "string"},
+            },
+            "required": [
+                "fecha_hora", "municipio", "direccion_aproximada",
+                "tipo_via", "condicion_climatica", "descripcion_dinamica",
+            ],
+        },
+        "vehiculos": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "rol": {"type": "string", "enum": _ROLES_VEHICULO},
+                    "marca": {"type": "string", "nullable": True},
+                    "modelo": {"type": "string", "nullable": True},
+                    "año": {"type": "integer", "nullable": True},
+                    "matricula": {"type": "string", "nullable": True},
+                    "color": {"type": "string", "nullable": True},
+                    "conductor_nombre": {"type": "string", "nullable": True},
+                    "conductor_ci": {"type": "string", "nullable": True},
+                    "licencia_numero": {"type": "string", "nullable": True},
+                    "licencia_categoria": {"type": "string", "nullable": True},
+                    "danios_descripcion": {"type": "string", "nullable": True},
+                },
+                "required": [
+                    "rol", "marca", "modelo", "año", "matricula", "color",
+                    "conductor_nombre", "conductor_ci", "licencia_numero",
+                    "licencia_categoria", "danios_descripcion",
+                ],
+            },
+        },
+        "poliza": {
+            "type": "object",
+            "properties": {
+                "numero": {"type": "string", "nullable": True},
+                "aseguradora": {"type": "string", "nullable": True},
+                "vigencia_desde": {"type": "string", "nullable": True},
+                "vigencia_hasta": {"type": "string", "nullable": True},
+                "cobertura_tipo": {
+                    "type": "string",
+                    "enum": ["RESPONSABILIDAD_CIVIL", "TODO_RIESGO", "PARCIAL", "DESCONOCIDO"],
+                },
+                "suma_asegurada": {"type": "number", "nullable": True},
+                "franquicia": {"type": "number", "nullable": True},
+            },
+            "required": [
+                "numero", "aseguradora", "vigencia_desde", "vigencia_hasta",
+                "cobertura_tipo", "suma_asegurada", "franquicia",
+            ],
+        },
+        "documentacion": {
+            "type": "object",
+            "properties": {
+                "poliza_presente": {"type": "boolean"},
+                "denuncia_policial_presente": {"type": "boolean"},
+                "denuncia_administrativa_presente": {"type": "boolean"},
+                "pericia_tecnica_presente": {"type": "boolean"},
+                "fotos_evento_cantidad": {"type": "integer"},
+                "cedula_verde_presente": {"type": "boolean"},
+                "licencia_conductor_presente": {"type": "boolean"},
+            },
+            "required": [
+                "poliza_presente", "denuncia_policial_presente", "denuncia_administrativa_presente",
+                "pericia_tecnica_presente", "fotos_evento_cantidad", "cedula_verde_presente",
+                "licencia_conductor_presente",
+            ],
+        },
+        "monto_danios": {
+            "type": "object",
+            "properties": {
+                "estimacion_pericia": {"type": "number", "nullable": True},
+                "moneda_original": {"type": "string"},
+            },
+            "required": ["estimacion_pericia", "moneda_original"],
+        },
+        "conflictos": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "campo": {"type": "string"},
+                    "valor_doc_1": {"type": "string"},
+                    "valor_doc_2": {"type": "string"},
+                    "descripcion": {"type": "string"},
+                },
+                "required": ["campo", "valor_doc_1", "valor_doc_2", "descripcion"],
+            },
+        },
+        "calidad_extraccion": {
+            "type": "object",
+            "properties": {
+                "score": {"type": "number", "description": "Escala 0.0 a 1.0, nunca 0 a 100"},
+                "campos_faltantes_criticos": {"type": "array", "items": {"type": "string"}},
+                "observaciones": {"type": "string", "nullable": True},
+            },
+            "required": ["score", "campos_faltantes_criticos", "observaciones"],
+        },
+    },
+    "required": [
+        "siniestro", "vehiculos", "poliza", "documentacion",
+        "monto_danios", "conflictos", "calidad_extraccion",
+    ],
+}
+
 
 def ejecutar_paso_b(resultados_a: list[dict], caso_id: str) -> dict | None:
     """Extrae variables críticas del conjunto de documentos clasificados."""
@@ -235,7 +382,7 @@ def ejecutar_paso_b(resultados_a: list[dict], caso_id: str) -> dict | None:
             f"Devuelve EXCLUSIVAMENTE este JSON:\n{_SCHEMA_B}"
         )
 
-    respuesta = llamar_gemini(_SYSTEM_B, prompt, partes=partes)
+    respuesta = llamar_gemini(_SYSTEM_B, prompt, partes=partes, response_schema=_ESQUEMA_B)
     if respuesta:
         result = parsear_json(respuesta)
         if result:
@@ -294,6 +441,59 @@ _SCHEMA_C = """
 }
 """.strip()
 
+_ESQUEMA_C = {
+    "type": "object",
+    "properties": {
+        "dictamen": {
+            "type": "object",
+            "properties": {
+                "dictamen_posible": {"type": "boolean"},
+                "datos_faltantes_para_dictamen": {"type": "array", "items": {"type": "string"}},
+                "responsabilidad_sugerida": {
+                    "type": "string",
+                    "enum": [
+                        "ASEGURADO_RESPONSABLE", "TERCERO_RESPONSABLE",
+                        "RESPONSABILIDAD_COMPARTIDA", "CASO_FORTUITO", "INDETERMINADO",
+                    ],
+                },
+                "porcentaje_responsabilidad_asegurado": {"type": "number"},
+                "porcentaje_responsabilidad_tercero": {"type": "number"},
+                "cobertura_aplica": {"type": "boolean"},
+                "razon_cobertura": {"type": "string"},
+                "franquicia_aplica": {"type": "boolean"},
+                "monto_sugerido_liquidar": {"type": "number", "nullable": True},
+                "infracciones_detectadas": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "infractor": {"type": "string", "enum": _ROLES_VEHICULO},
+                            "descripcion_infraccion": {"type": "string"},
+                            "articulo_ley_5016": {"type": "string", "nullable": True},
+                            "articulo_ordenanza": {"type": "string", "nullable": True},
+                        },
+                        "required": [
+                            "infractor", "descripcion_infraccion",
+                            "articulo_ley_5016", "articulo_ordenanza",
+                        ],
+                    },
+                },
+                "analisis_narrativo": {"type": "string"},
+                "alertas_liquidador": {"type": "array", "items": {"type": "string"}},
+                "confianza_dictamen": {"type": "number", "description": "Escala 0.0 a 1.0, nunca 0 a 100"},
+            },
+            "required": [
+                "dictamen_posible", "datos_faltantes_para_dictamen", "responsabilidad_sugerida",
+                "porcentaje_responsabilidad_asegurado", "porcentaje_responsabilidad_tercero",
+                "cobertura_aplica", "razon_cobertura", "franquicia_aplica",
+                "monto_sugerido_liquidar", "infracciones_detectadas",
+                "analisis_narrativo", "alertas_liquidador", "confianza_dictamen",
+            ],
+        },
+    },
+    "required": ["dictamen"],
+}
+
 
 def ejecutar_paso_c(
     json_paso_b: dict,
@@ -335,7 +535,7 @@ DATOS DEL CASO (Paso B):
 Devuelve EXCLUSIVAMENTE este JSON:
 {_SCHEMA_C}""".strip()
 
-    respuesta = llamar_gemini(_SYSTEM_C, prompt)
+    respuesta = llamar_gemini(_SYSTEM_C, prompt, response_schema=_ESQUEMA_C)
     if respuesta:
         result = parsear_json(respuesta)
         if result:

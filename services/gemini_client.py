@@ -38,11 +38,17 @@ def llamar_gemini(
     prompt_usuario: str,
     partes: list | None = None,
     modelo: str = GEMINI_MODEL,
+    response_schema: dict | None = None,
 ) -> str | None:
     """
     Llama a Gemini con reintentos automáticos.
     Si se proveen `partes` (archivos de la File API), se construye
     contenido multimodal: [*partes, prompt_usuario].
+
+    Si se provee `response_schema` (dict estilo OpenAPI: type/properties/items/
+    enum/nullable/required), Gemini queda forzado a devolver JSON que cumple
+    esos tipos y campos obligatorios — evita que un campo declarado string
+    llegue como null/objeto/array inesperado a los consumidores del resultado.
     """
     model = genai.GenerativeModel(
         model_name=modelo,
@@ -50,9 +56,16 @@ def llamar_gemini(
     )
     contenido = (list(partes) + [prompt_usuario]) if partes else prompt_usuario
 
+    generation_config = None
+    if response_schema is not None:
+        generation_config = genai.GenerationConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+        )
+
     for intento in range(1, MAX_RETRIES + 1):
         try:
-            respuesta = model.generate_content(contenido)
+            respuesta = model.generate_content(contenido, generation_config=generation_config)
             return respuesta.text
         except Exception as e:
             if intento < MAX_RETRIES:

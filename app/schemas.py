@@ -50,6 +50,7 @@ class IndexarTextoRequest(BaseModel):
     texto: str = Field(..., description="Contenido textual del documento")
     municipio: str = Field("Nacional", description="Municipio al que aplica la norma")
     tipo: str = Field("LEY", description="Tipo de documento: LEY | ORDENANZA | DECRETO")
+    owner_id: str = Field("global", description="Dueño del documento; 'global' = visible para todos")
 
 
 class IndexarTextoResponse(BaseModel):
@@ -74,6 +75,7 @@ class BusquedaLegalResponse(BaseModel):
 
 class FuentesResponse(BaseModel):
     fuentes: list[str]
+    fuentes_propias: list[str] = []   # subconjunto de `fuentes` que el dueño puede borrar
     total_chunks: int
     total_casos_historicos: int
 

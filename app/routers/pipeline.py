@@ -94,7 +94,9 @@ def _guardar_archivos_temp(archivos: list[UploadFile], directorio: Path) -> list
     return resultado
 
 
-def _ejecutar_y_limpiar(job_id: str, caso_id: str, directorio: Path, usar_rag: bool) -> None:
+def _ejecutar_y_limpiar(
+    job_id: str, caso_id: str, directorio: Path, usar_rag: bool, owner_id: str | None = None,
+) -> None:
     """Worker de thread: ejecuta el pipeline y limpia archivos temporales."""
     from services import gemini_client
     from services.pipeline import ejecutar_pipeline
@@ -111,7 +113,7 @@ def _ejecutar_y_limpiar(job_id: str, caso_id: str, directorio: Path, usar_rag: b
             if f.is_file() and f.suffix.lower() in _EXTENSIONES_PERMITIDAS
         ]
 
-        resultado = ejecutar_pipeline(caso_id, archivos, usar_rag=usar_rag)
+        resultado = ejecutar_pipeline(caso_id, archivos, usar_rag=usar_rag, owner_id=owner_id)
 
         if resultado.get("error") and not resultado.get("paso_a"):
             _actualizar_job(
@@ -167,6 +169,7 @@ async def ejecutar_pipeline_sync(
     caso_id: Annotated[str, Form(description="Identificador único del caso")],
     archivos: Annotated[list[UploadFile], File(description="Documentos del caso (PDF, imágenes, DOCX, TXT)")],
     usar_rag: Annotated[bool, Form(description="Activar búsqueda semántica en corpus legal (requiere ChromaDB)")] = False,
+    owner_id: Annotated[str | None, Form(description="Dueño del caso: define qué corpus y precedentes ve el RAG")] = None,
 ):
     """
     Ejecuta el pipeline A→B→C de forma síncrona y retorna los resultados completos.
@@ -190,7 +193,7 @@ async def ejecutar_pipeline_sync(
     try:
         gemini_client.configure(settings.gemini_api_key)
         lista_archivos = _guardar_archivos_temp(archivos, directorio)
-        resultado = ejecutar_pipeline(caso_id, lista_archivos, usar_rag=usar_rag)
+        resultado = ejecutar_pipeline(caso_id, lista_archivos, usar_rag=usar_rag, owner_id=owner_id)
     finally:
         shutil.rmtree(directorio, ignore_errors=True)
 
@@ -221,6 +224,7 @@ async def ejecutar_pipeline_async(
     caso_id: Annotated[str, Form()],
     archivos: Annotated[list[UploadFile], File()],
     usar_rag: Annotated[bool, Form()] = False,
+    owner_id: Annotated[str | None, Form()] = None,
 ):
     """
     Encola el pipeline y retorna un `job_id` de inmediato.
@@ -244,7 +248,7 @@ async def ejecutar_pipeline_async(
 
     hilo = threading.Thread(
         target=_ejecutar_y_limpiar,
-        args=(job_id, caso_id, directorio, usar_rag),
+        args=(job_id, caso_id, directorio, usar_rag, owner_id),
         daemon=True,
     )
     hilo.start()

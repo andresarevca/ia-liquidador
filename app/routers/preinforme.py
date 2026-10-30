@@ -16,6 +16,18 @@ from app.schemas import GenerarPreinformeRequest, PreinformeData
 router = APIRouter(prefix="/api/preinforme", tags=["Pre-Informe"])
 
 
+def _nulos_a_vacio(datos: dict) -> dict:
+    """Gemini puede devolver `null` en campos que el esquema exige como texto.
+
+    `dict.get(clave, "")` solo usa el valor por defecto si la clave no existe,
+    no si vale None. Se normalizan aqui los campos `str` obligatorios.
+    """
+    for nombre, campo in PreinformeData.model_fields.items():
+        if campo.annotation is str and datos.get(nombre) is None:
+            datos[nombre] = ""
+    return datos
+
+
 @router.post(
     "/generar",
     response_model=PreinformeData,
@@ -38,4 +50,4 @@ async def generar_preinforme(body: GenerarPreinformeRequest):
         paso_c=body.paso_c,
         metadatos=body.metadatos.model_dump() if body.metadatos else {},
     )
-    return PreinformeData(**datos)
+    return PreinformeData(**_nulos_a_vacio(datos))

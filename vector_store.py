@@ -61,6 +61,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 VECTOR_DB_PATH   = "vector_db"           # carpeta local del store persistente
 COL_LEGAL        = "corpus_legal"
+OWNER_GLOBAL     = "global"   # normas oficiales visibles para todos
 COL_CASOS        = "casos_historicos"
 EMBEDDING_MODEL  = "models/gemini-embedding-001"
 OCR_MODEL        = "gemini-2.5-flash"
@@ -220,6 +221,11 @@ def _chunkear_por_tamano(texto: str, titulo_doc: str) -> list[dict]:
     return chunks
 
 
+def _propietarios_visibles(owner_id: Optional[str]) -> list[str]:
+    """Dueños cuyo contenido ve owner_id: el global más el propio."""
+    return [OWNER_GLOBAL] + ([owner_id] if owner_id and owner_id != OWNER_GLOBAL else [])
+
+
 # ---------------------------------------------------------------------------
 # CorpusLegal
 # ---------------------------------------------------------------------------
@@ -251,9 +257,11 @@ class CorpusLegal:
         texto: str,
         municipio: str = "Nacional",
         tipo: str = "LEY",
+        owner_id: str = OWNER_GLOBAL,
     ) -> int:
         """
         Indexa un texto legal chunkeado por artículos.
+        owner_id="global" lo hace visible para todos; otro valor lo limita a ese dueño.
         Omite chunks ya existentes (idempotente).
         Retorna el número de chunks efectivamente indexados.
         """
@@ -264,6 +272,8 @@ class CorpusLegal:
         ids, documentos, metadatas = [], [], []
         for i, chunk in enumerate(chunks):
             doc_id = f"{re.sub(r'[^a-z0-9]', '_', titulo.lower())}_{i}"
+            if owner_id != OWNER_GLOBAL:
+                doc_id = f"{re.sub(r'[^a-z0-9]', '_', owner_id.lower())}__{doc_id}"
             if self._col.get(ids=[doc_id])["ids"]:
                 continue  # ya existe
             ids.append(doc_id)
@@ -271,6 +281,7 @@ class CorpusLegal:
             metadatas.append({
                 "fuente": titulo,
                 "municipio": municipio,
+                "owner_id": owner_id,
                 "tipo_doc": tipo,
                 "encabezado": chunk.get("encabezado", "")[:200],
                 "tipo_chunk": chunk.get("tipo_chunk", "chunk"),
@@ -286,35 +297,35 @@ class CorpusLegal:
             )
         return len(ids)
 
-    def indexar_pdf(self, archivo: Path, municipio: str) -> int:
+    def indexar_pdf(self, archivo: Path, municipio: str, owner_id: str = OWNER_GLOBAL) -> int:
         """
-        Extrae texto de un PDF y lo indexa en el corpus legal.
+        Extrae texto de un PDF o DOCX y lo indexa en el corpus legal.
         Lanza PDFExtractionError si ningún método (directo ni OCR Gemini) tiene éxito.
         """
-        texto = _extraer_texto_pdf(archivo)   # raises PDFExtractionError on failure
+        if archivo.suffix.lower() == ".docx":
+            texto = _extraer_texto_docx(archivo)
+        else:
+            texto = _extraer_texto_pdf(archivo)   # raises PDFExtractionError on failure
         titulo = archivo.stem
-        return self.indexar_texto(titulo, texto, municipio=municipio, tipo="ORDENANZA")
+        return self.indexar_texto(titulo, texto, municipio=municipio, tipo="ORDENANZA", owner_id=owner_id)
 
     def buscar_relevantes(
         self,
         consulta: str,
         n: int = TOP_K_LEGAL,
         municipio: Optional[str] = None,
+        owner_id: Optional[str] = None,
     ) -> list[dict]:
         """
         Búsqueda semántica en el corpus legal.
         Si municipio está dado, filtra por ese municipio Y normas nacionales.
+        Solo ve el corpus global y, si owner_id está dado, el de ese dueño.
         """
         total = self._col.count()
         if total == 0:
             return []
 
-        where = None
-        if municipio and municipio not in ("Nacional", "", None):
-            where = {"$or": [
-                {"municipio": {"$eq": municipio}},
-                {"municipio": {"$eq": "Nacional"}},
-            ]}
+        where = self._filtro_visibilidad(owner_id, municipio)
 
         emb_q = _embed_consulta(consulta)
         res = self._col.query(
@@ -339,14 +350,62 @@ class CorpusLegal:
             })
         return salida
 
-    def contar(self) -> int:
-        return self._col.count()
+    @staticmethod
+    def _filtro_visibilidad(owner_id: Optional[str], municipio: Optional[str] = None) -> dict:
+        condiciones: list[dict] = [{"owner_id": {"$in": _propietarios_visibles(owner_id)}}]
+        if municipio and municipio not in ("Nacional", "", None):
+            condiciones.append({"$or": [
+                {"municipio": {"$eq": municipio}},
+                {"municipio": {"$eq": "Nacional"}},
+            ]})
+        return condiciones[0] if len(condiciones) == 1 else {"$and": condiciones}
 
-    def listar_fuentes(self) -> list[str]:
-        """Retorna la lista de documentos legales indexados (sin duplicados)."""
-        todos = self._col.get(include=["metadatas"])
+    def contar(self, owner_id: Optional[str] = None) -> int:
+        """Chunks visibles para owner_id (global + propios). Sin owner_id: solo global."""
+        res = self._col.get(where=self._filtro_visibilidad(owner_id), include=[])
+        return len(res["ids"])
+
+    def listar_fuentes(self, owner_id: Optional[str] = None) -> list[str]:
+        """Retorna los documentos legales visibles para owner_id (sin duplicados)."""
+        todos = self._col.get(where=self._filtro_visibilidad(owner_id), include=["metadatas"])
         fuentes = {m.get("fuente", "") for m in todos["metadatas"]}
         return sorted(fuentes)
+
+    def listar_fuentes_propias(self, owner_id: str) -> list[str]:
+        """Documentos cuyo dueño es exactamente owner_id (los que puede borrar)."""
+        res = self._col.get(where={"owner_id": {"$eq": owner_id}}, include=["metadatas"])
+        return sorted({m.get("fuente", "") for m in res["metadatas"]})
+
+    def eliminar_fuente(self, fuente: str, owner_id: str) -> int:
+        """Borra los chunks de un documento de ese dueño. Retorna cuántos borró."""
+        res = self._col.get(
+            where={"$and": [{"fuente": {"$eq": fuente}}, {"owner_id": {"$eq": owner_id}}]},
+            include=[],
+        )
+        if res["ids"]:
+            self._col.delete(ids=res["ids"])
+        return len(res["ids"])
+
+    def eliminar_dueno(self, owner_id: str) -> int:
+        """Borra todo el corpus de un dueño (p. ej. al eliminar su usuario)."""
+        if owner_id == OWNER_GLOBAL:
+            raise ValueError("No se puede eliminar el corpus global en bloque.")
+        res = self._col.get(where={"owner_id": {"$eq": owner_id}}, include=[])
+        if res["ids"]:
+            self._col.delete(ids=res["ids"])
+        return len(res["ids"])
+
+    def migrar_a_global(self) -> int:
+        """Asigna owner_id="global" a los chunks previos al soporte multi-dueño."""
+        todos = self._col.get(include=["metadatas"])
+        ids, metas = [], []
+        for id_, m in zip(todos["ids"], todos["metadatas"]):
+            if "owner_id" not in m:
+                ids.append(id_)
+                metas.append({**m, "owner_id": OWNER_GLOBAL})
+        if ids:
+            self._col.update(ids=ids, metadatas=metas)
+        return len(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -377,12 +436,16 @@ class CasosHistoricos:
         json_b: dict,
         json_c: Optional[dict],
         timestamp: str = "",
+        owner_id: str = OWNER_GLOBAL,
     ) -> bool:
         """
         Indexa un caso por su descripción narrativa y datos clave.
+        Un caso con owner_id distinto de "global" solo es visible como precedente para ese dueño.
         Retorna True si fue indexado, False si ya existía.
         """
         doc_id = f"{caso_id}_{timestamp}" if timestamp else caso_id
+        if owner_id != OWNER_GLOBAL:
+            doc_id = f"{re.sub(r'[^a-z0-9]', '_', owner_id.lower())}__{doc_id}"
         if self._col.get(ids=[doc_id])["ids"]:
             return False
 
@@ -410,6 +473,7 @@ class CasosHistoricos:
             "cobertura_tipo":  (poliza.get("cobertura_tipo") or "")[:40],
             "confianza":       str(dictamen.get("confianza_dictamen") or ""),
             "timestamp":       timestamp,
+            "owner_id":        owner_id,
         }
 
         emb = _embed_documentos([descripcion[:2000]])
@@ -425,8 +489,9 @@ class CasosHistoricos:
         self,
         descripcion_caso: str,
         n: int = TOP_K_CASOS,
+        owner_id: Optional[str] = None,
     ) -> list[dict]:
-        """Encuentra casos históricos similares al caso actual."""
+        """Encuentra casos similares: los globales más los del dueño indicado."""
         total = self._col.count()
         if total == 0:
             return []
@@ -435,6 +500,7 @@ class CasosHistoricos:
         res = self._col.query(
             query_embeddings=[emb_q],
             n_results=min(n, total),
+            where={"owner_id": {"$in": _propietarios_visibles(owner_id)}},
             include=["documents", "metadatas", "distances"],
         )
 
@@ -483,8 +549,21 @@ class CasosHistoricos:
                 continue
         return indexados
 
-    def contar(self) -> int:
-        return self._col.count()
+    def contar(self, owner_id: Optional[str] = None) -> int:
+        """Casos visibles para owner_id (globales + propios). Sin owner_id: solo globales."""
+        res = self._col.get(
+            where={"owner_id": {"$in": _propietarios_visibles(owner_id)}}, include=[],
+        )
+        return len(res["ids"])
+
+    def eliminar_dueno(self, owner_id: str) -> int:
+        """Borra todos los casos de un dueño (p. ej. al eliminar su usuario)."""
+        if owner_id == OWNER_GLOBAL:
+            raise ValueError("No se puede eliminar los casos globales en bloque.")
+        res = self._col.get(where={"owner_id": {"$eq": owner_id}}, include=[])
+        if res["ids"]:
+            self._col.delete(ids=res["ids"])
+        return len(res["ids"])
 
 
 # ---------------------------------------------------------------------------
@@ -496,12 +575,13 @@ def construir_contexto_legal_rag(
     municipio: str,
     corpus: CorpusLegal,
     n: int = TOP_K_LEGAL,
+    owner_id: Optional[str] = None,
 ) -> str:
     """
     Recupera los artículos legales más relevantes para el caso e
     construye un bloque de texto listo para insertar en el prompt del Paso C.
     """
-    resultados = corpus.buscar_relevantes(descripcion_caso, n=n, municipio=municipio)
+    resultados = corpus.buscar_relevantes(descripcion_caso, n=n, municipio=municipio, owner_id=owner_id)
     if not resultados:
         return "(Sin artículos recuperados del corpus legal)"
 
@@ -519,6 +599,26 @@ def construir_contexto_legal_rag(
 # ---------------------------------------------------------------------------
 # Utilidades internas
 # ---------------------------------------------------------------------------
+
+def _extraer_texto_docx(archivo: Path) -> str:
+    """Extrae el texto de un .docx (párrafos y tablas) en orden de aparición."""
+    try:
+        import docx
+    except ImportError:
+        raise PDFExtractionError(archivo=archivo.name, intentos=[("python-docx", "no instalado")])
+    try:
+        documento = docx.Document(str(archivo))
+        partes = [p.text for p in documento.paragraphs]
+        for tabla in documento.tables:
+            for fila in tabla.rows:
+                partes.append(" | ".join(c.text.strip() for c in fila.cells))
+        texto = "\n".join(partes).strip()
+    except Exception as e:
+        raise PDFExtractionError(archivo=archivo.name, intentos=[("python-docx", str(e))])
+    if not texto:
+        raise PDFExtractionError(archivo=archivo.name, intentos=[("python-docx", "documento sin texto")])
+    return texto
+
 
 def _extraer_texto_pdf(archivo: Path) -> str:
     """
@@ -635,12 +735,17 @@ def _cli_main():
                         help="Lista los documentos legales indexados")
     parser.add_argument("--indexar-historicos", action="store_true",
                         help="Indexa casos históricos desde resultados/")
+    parser.add_argument("--migrar-owner",       action="store_true",
+                        help="Marca como owner_id=global los chunks previos al soporte multi-dueño")
     parser.add_argument("--db",                 default=VECTOR_DB_PATH,
                         help=f"Ruta de la base de datos (default: {VECTOR_DB_PATH})")
     args = parser.parse_args()
 
     corpus  = CorpusLegal(db_path=args.db)
     casos   = CasosHistoricos(db_path=args.db)
+
+    if args.migrar_owner:
+        print(f"[OK] {corpus.migrar_a_global()} chunk(s) marcados como global")
 
     if args.init:
         # Importar las constantes del script principal

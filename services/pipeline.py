@@ -584,9 +584,13 @@ def ejecutar_pipeline(
     caso_id: str,
     archivos: list[dict],
     usar_rag: bool = False,
+    owner_id: str | None = None,
 ) -> dict:
     """
     Ejecuta el pipeline completo A → B → C.
+
+    owner_id: dueño del caso. El RAG ve el corpus global más el de ese dueño, y el caso
+    se guarda como precedente privado suyo; sin owner_id no se guarda ningún precedente.
 
     archivos: [{"ruta": str, "nombre": str}]
     Retorna dict con: paso_a, paso_b, paso_c, error, tiempo_segundos.
@@ -618,8 +622,8 @@ def ejecutar_pipeline(
                 descripcion = resultado_b.get("siniestro", {}).get("descripcion_dinamica", caso_id)
                 corpus = CorpusLegal()
                 casos_hist = CasosHistoricos()
-                contexto_legal = construir_contexto_legal_rag(descripcion, municipio, corpus)
-                precedentes = casos_hist.buscar_similares(descripcion)
+                contexto_legal = construir_contexto_legal_rag(descripcion, municipio, corpus, owner_id=owner_id)
+                precedentes = casos_hist.buscar_similares(descripcion, owner_id=owner_id)
             except Exception as e:
                 logger.warning(f"RAG no disponible, continuando sin él: {e}")
 
@@ -628,11 +632,11 @@ def ejecutar_pipeline(
             return {"paso_a": resultado_a, "paso_b": resultado_b, "error": "Paso C: fallo en dictamen"}
 
         # Si RAG disponible, indexar este caso en casos históricos
-        if usar_rag and resultado_b and resultado_c:
+        if usar_rag and owner_id and resultado_b and resultado_c:
             try:
                 from vector_store import CasosHistoricos
                 casos_hist = CasosHistoricos()
-                casos_hist.indexar_caso(caso_id, resultado_b, resultado_c)
+                casos_hist.indexar_caso(caso_id, resultado_b, resultado_c, owner_id=owner_id)
             except Exception:
                 pass
 

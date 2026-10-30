@@ -41,6 +41,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("GEMINI_API_KEY no configurada. El pipeline no funcionará hasta que se configure.")
 
+    # Migración idempotente: el corpus indexado antes del soporte multi-dueño pasa a "global".
+    try:
+        from vector_store import CorpusLegal
+        migrados = CorpusLegal(db_path=settings.vector_db_path).migrar_a_global()
+        if migrados:
+            logger.info("Corpus legal: %d chunk(s) previos marcados como owner_id=global.", migrados)
+    except Exception as e:
+        logger.warning("No se pudo migrar el corpus a owner_id=global: %s", e)
+
     logger.info("Microservicio ia-liquidador iniciado.")
     yield
     logger.info("Microservicio ia-liquidador detenido.")

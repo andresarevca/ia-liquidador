@@ -81,7 +81,9 @@ async def indexar_texto(body: IndexarTextoRequest):
     """
     _configurar_gemini()
     corpus = _get_corpus()
-    n = corpus.indexar_texto(body.titulo, body.texto, municipio=body.municipio, tipo=body.tipo)
+    n = corpus.indexar_texto(
+        body.titulo, body.texto, municipio=body.municipio, tipo=body.tipo, owner_id=body.owner_id,
+    )
     return IndexarTextoResponse(titulo=body.titulo, chunks_indexados=n, municipio=body.municipio)
 
 
@@ -94,17 +96,18 @@ async def indexar_texto(body: IndexarTextoRequest):
 async def indexar_pdf(
     archivo: Annotated[UploadFile, File(description="PDF de la ordenanza municipal")],
     municipio: Annotated[str, Query(description="Municipio al que aplica la ordenanza")] = "Nacional",
+    owner_id: Annotated[str, Query(description="Dueño del documento; 'global' = visible para todos")] = "global",
 ):
     """
-    Sube un PDF, extrae su texto y lo indexa en el corpus legal.
+    Sube un PDF o DOCX, extrae su texto y lo indexa en el corpus legal.
     Útil para cargar ordenanzas de distintos municipios de Paraguay.
     """
     _configurar_gemini()
 
-    if not archivo.filename or not archivo.filename.lower().endswith(".pdf"):
+    if not archivo.filename or not archivo.filename.lower().endswith((".pdf", ".docx")):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Solo se aceptan archivos PDF.",
+            detail="Solo se aceptan archivos PDF o DOCX.",
         )
 
     settings = get_settings()
@@ -117,7 +120,7 @@ async def indexar_pdf(
             shutil.copyfileobj(archivo.file, f)
 
         corpus = _get_corpus()
-        n = corpus.indexar_pdf(ruta, municipio=municipio)
+        n = corpus.indexar_pdf(ruta, municipio=municipio, owner_id=owner_id)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -134,11 +137,12 @@ async def buscar(
     q: Annotated[str, Query(description="Texto de la consulta legal", min_length=3)],
     municipio: Annotated[str | None, Query(description="Filtrar por municipio (opcional)")] = None,
     n: Annotated[int, Query(description="Número máximo de resultados", ge=1, le=20)] = 6,
+    owner_id: Annotated[str | None, Query(description="Incluye además el corpus privado de este dueño")] = None,
 ):
     """Realiza una búsqueda semántica en el corpus de textos legales indexados."""
     _configurar_gemini()
     corpus = _get_corpus()
-    resultados = corpus.buscar_relevantes(q, n=n, municipio=municipio)
+    resultados = corpus.buscar_relevantes(q, n=n, municipio=municipio, owner_id=owner_id)
 
     return BusquedaLegalResponse(
         consulta=q,
@@ -153,15 +157,49 @@ async def buscar(
     summary="Listar documentos legales indexados",
     dependencies=[Depends(verificar_api_key)],
 )
-async def listar_fuentes():
+async def listar_fuentes(
+    owner_id: Annotated[str | None, Query(description="Incluye además el corpus privado de este dueño")] = None,
+):
     """Retorna la lista de documentos legales indexados y estadísticas del corpus."""
     corpus = _get_corpus()
     casos = _get_casos()
     return FuentesResponse(
-        fuentes=corpus.listar_fuentes(),
-        total_chunks=corpus.contar(),
-        total_casos_historicos=casos.contar(),
+        fuentes=corpus.listar_fuentes(owner_id),
+        fuentes_propias=corpus.listar_fuentes_propias(owner_id or "global"),
+        total_chunks=corpus.contar(owner_id),
+        total_casos_historicos=casos.contar(owner_id),
     )
+
+
+@router.delete(
+    "/fuente",
+    summary="Eliminar un documento del corpus de un dueño",
+    dependencies=[Depends(verificar_api_key)],
+)
+async def eliminar_fuente(
+    fuente: Annotated[str, Query(description="Título exacto del documento")],
+    owner_id: Annotated[str, Query(description="Dueño del documento ('global' para el corpus global)")],
+):
+    """Solo borra chunks cuyo dueño coincide con owner_id; nunca los de otro."""
+    n = _get_corpus().eliminar_fuente(fuente, owner_id)
+    if n == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado.")
+    return {"fuente": fuente, "chunks_eliminados": n}
+
+
+@router.delete(
+    "/dueno/{owner_id}",
+    summary="Eliminar todo el corpus y los casos de un dueño",
+    dependencies=[Depends(verificar_api_key)],
+)
+async def eliminar_dueno(owner_id: str):
+    """Limpieza al eliminar un usuario. No acepta 'global'."""
+    if owner_id == "global":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No se puede eliminar 'global'.")
+    return {
+        "chunks_eliminados": _get_corpus().eliminar_dueno(owner_id),
+        "casos_eliminados": _get_casos().eliminar_dueno(owner_id),
+    }
 
 
 @router.post(
